@@ -1,6 +1,7 @@
 /*
- * GB COLD WALLET  --  BIP39 12-word edition
+ * GB COLD WALLET
  *
+ *   A Bitcoin BIP39 12-word seed generator that runs on a real Game Boy.
  *   The world's most air-gapped (and slowest) crypto seed generator.
  *
  *   Built with GBDK-2020 4.5.0.
@@ -27,7 +28,7 @@
  *   WHITENING
  *   ---------
  *   The pool is run through HMAC-SHA256 with a fixed domain-separator
- *   key ("GB-COLDWALLET-v2-BIP39-entropy"), and the first 16 bytes are
+ *   key ("GB-COLDWALLET-BIP39-entropy"), and the first 16 bytes are
  *   used as 128-bit BIP39 entropy.  HMAC -- not bare SHA-256 -- guards
  *   against length-extension and is standard practice (RFC 5869 style).
  *
@@ -198,9 +199,8 @@ void hmac_sha256(const uint8_t *key, uint8_t klen,
     sha_final(&c, out);
 }
 
-/* Domain-separator key.  Bumping the version invalidates seeds derived
-   from a previous build with the same pool bytes. */
-static const uint8_t HMAC_KEY[] = "GB-COLDWALLET-v2-BIP39-entropy";
+/* Domain-separator key for HMAC-SHA256 pool whitening. */
+static const uint8_t HMAC_KEY[] = "GB-COLDWALLET-BIP39-entropy";
 #define HMAC_KEY_LEN (sizeof(HMAC_KEY) - 1)
 
 /* ====================================================================
@@ -327,7 +327,7 @@ uint8_t title_screen(void) {
     uint8_t pad;
     clrscr();
     gotoxy(2, 1);  printf("GB COLD WALLET");
-    gotoxy(3, 2);  printf("BIP39  EDITION");
+    gotoxy(2, 2);  printf("BITCOIN  SEED");
     gotoxy(0, 4);  printf("12-word seed,");
     gotoxy(0, 5);  printf("HMAC-SHA256");
     gotoxy(0, 6);  printf("whitened entropy.");
@@ -471,7 +471,7 @@ void info_screen(void) {
     gotoxy(0, 7); printf("word English list.");
     gotoxy(0, 9); printf("Pool whitened by");
     gotoxy(0, 10); printf("HMAC-SHA256, key:");
-    gotoxy(0, 11); printf("GB-COLDWALLET-v2");
+    gotoxy(0, 11); printf("GB-COLDWALLET");
     gotoxy(0, 13); printf("Compatible with:");
     gotoxy(0, 14); printf("Electrum, Trezor,");
     gotoxy(0, 15); printf("Sparrow, Ledger.");

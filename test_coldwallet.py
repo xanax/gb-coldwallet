@@ -135,7 +135,7 @@ def pack_bits(bits) -> bytes:
 # Domain-separator key (must match HMAC_KEY in coldwallet.c)
 # ---------------------------------------------------------------------------
 
-HMAC_KEY = b"GB-COLDWALLET-v2-BIP39-entropy"
+HMAC_KEY = b"GB-COLDWALLET-BIP39-entropy"
 
 def derive_from_pool(pool: bytes) -> list:
     """Mirror the C make_mnemonic(): HMAC-SHA256(pool) -> 16-byte entropy -> mnemonic."""
