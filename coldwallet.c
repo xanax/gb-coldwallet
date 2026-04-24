@@ -5,13 +5,34 @@
  *
  *   Built with GBDK-2020 4.5.0.
  *
- *   - Harvests entropy from joypad input timings + DIV register + sys_time
- *   - Runs real SHA-256 on the Game Boy CPU (DMG, ~4 MHz)
- *   - Produces a valid BIP39 12-word English mnemonic seed
- *     (128 bits entropy + 4-bit SHA-256 checksum)
+ *   ENTROPY SOURCES
+ *   ---------------
+ *   Two independent collection modes are offered:
+ *
+ *     BUTTON MODE (A on title)
+ *       100 button presses.  At every press edge -- detected in a tight
+ *       polling loop, NOT a vblank wait -- we sample:
+ *           DIV_REG   (8-bit, increments at 16384 Hz)
+ *           TIMA_REG  (8-bit, configured at 262144 Hz)
+ *           LY_REG    (8-bit scanline counter, ~9.2 kHz)
+ *           the pad bitmask
+ *       Press timing is therefore resolved to ~16 CPU cycles, not the
+ *       17 ms vblank quantum.
+ *
+ *     COIN MODE (SELECT on title)
+ *       128 D-pad flips (Up = 1, Down = 0).  Provides 128 directly
+ *       observable, hardware-RNG-free entropy bits independent of any
+ *       timing assumptions -- the gold standard for paper wallets.
+ *
+ *   WHITENING
+ *   ---------
+ *   The pool is run through HMAC-SHA256 with a fixed domain-separator
+ *   key ("GB-COLDWALLET-v2-BIP39-entropy"), and the first 16 bytes are
+ *   used as 128-bit BIP39 entropy.  HMAC -- not bare SHA-256 -- guards
+ *   against length-extension and is standard practice (RFC 5869 style).
  *
  *   THIS IS A NOVELTY. DO NOT FUND THE GENERATED SEED.
- *   The GB has weak entropy and zero side-channel protection.
+ *   The GB has no side-channel protection.
  */
 
 #include <gb/gb.h>
@@ -143,10 +164,47 @@ void sha_final(sha_ctx *c, uint8_t *out) {
 }
 
 /* ====================================================================
- *  ENTROPY POOL
+ *  HMAC-SHA256  (RFC 2104)
  *
- *  Mix 64 user button-press events with DIV + sys_time, hashed
- *  through SHA-256.  Output: 16-byte (128-bit) entropy.
+ *  Block size = 64 bytes.  Key must be shorter than 64 bytes; the only
+ *  caller passes a fixed compile-time string.
+ * ==================================================================== */
+
+void hmac_sha256(const uint8_t *key, uint8_t klen,
+                 const uint8_t *msg, uint16_t mlen,
+                 uint8_t *out)
+{
+    uint8_t block[64];
+    uint8_t inner[32];
+    sha_ctx c;
+    uint8_t i;
+
+    /* ipad */
+    for (i = 0; i < 64; i++) block[i] = 0x36;
+    for (i = 0; i < klen; i++) block[i] ^= key[i];
+
+    sha_init(&c);
+    sha_update(&c, block, 64);
+    sha_update(&c, msg, mlen);
+    sha_final(&c, inner);
+
+    /* opad */
+    for (i = 0; i < 64; i++) block[i] = 0x5c;
+    for (i = 0; i < klen; i++) block[i] ^= key[i];
+
+    sha_init(&c);
+    sha_update(&c, block, 64);
+    sha_update(&c, inner, 32);
+    sha_final(&c, out);
+}
+
+/* Domain-separator key.  Bumping the version invalidates seeds derived
+   from a previous build with the same pool bytes. */
+static const uint8_t HMAC_KEY[] = "GB-COLDWALLET-v2-BIP39-entropy";
+#define HMAC_KEY_LEN (sizeof(HMAC_KEY) - 1)
+
+/* ====================================================================
+ *  ENTROPY POOL
  * ==================================================================== */
 
 uint8_t pool[64];
@@ -170,10 +228,12 @@ void pool_byte(uint8_t b) {
     }
 }
 
-void mix_tick(uint8_t evt) {
+/* Sample every available cheap entropy source.  Called at the exact
+   moment a press edge is observed, inside the tight polling loop. */
+void mix_press(uint8_t evt) {
     pool_byte(DIV_REG);
-    pool_byte((uint8_t)sys_time);
-    pool_byte((uint8_t)(sys_time >> 8));
+    pool_byte(TIMA_REG);
+    pool_byte(LY_REG);
     pool_byte(evt);
 }
 
@@ -195,11 +255,25 @@ uint16_t extract11(const uint8_t *src, uint16_t off) {
     uint32_t v = ((uint32_t)src[byte_off]     << 16) |
                  ((uint32_t)src[byte_off + 1] <<  8) |
                   (uint32_t)src[byte_off + 2];
-    /* 24 bits in v; we want bits [bit_off .. bit_off+10] from the top. */
     v >>= (24 - 11 - bit_off);
     return (uint16_t)(v & 0x7FF);
 }
 
+/* Pack nbits 0/1 input bytes (MSB first) into ceil(nbits/8) output bytes. */
+void pack_bits(const uint8_t *bits, uint16_t nbits, uint8_t *out) {
+    uint16_t i;
+    uint8_t  acc = 0;
+    uint8_t  n   = 0;
+    uint16_t o   = 0;
+    for (i = 0; i < nbits; i++) {
+        acc = (uint8_t)((acc << 1) | (bits[i] & 1));
+        n++;
+        if (n == 8) { out[o++] = acc; acc = 0; n = 0; }
+    }
+    if (n) out[o] = (uint8_t)(acc << (8 - n));
+}
+
+/* Build the 12-word mnemonic from the current `pool` via HMAC-SHA256. */
 void make_mnemonic(void) {
     uint8_t ent[20];   /* 16 entropy + 1 checksum + 3 byte read-ahead pad */
     uint8_t hash[32];
@@ -209,10 +283,8 @@ void make_mnemonic(void) {
 
     for (i = 0; i < 20; i++) ent[i] = 0;
 
-    /* finalize entropy pool -> 32-byte hash, take first 16 as entropy */
-    sha_init(&c);
-    sha_update(&c, pool, pool_len);
-    sha_final(&c, hash);
+    /* Whiten the pool with HMAC-SHA256 keyed by the domain separator. */
+    hmac_sha256(HMAC_KEY, HMAC_KEY_LEN, pool, pool_len, hash);
     for (i = 0; i < 16; i++) ent[i] = hash[i];
 
     /* checksum = top 4 bits of SHA-256(entropy) */
@@ -234,6 +306,9 @@ const char *word_at(uint16_t idx) {
  *  UI
  * ==================================================================== */
 
+#define BTN_PRESSES 100
+#define COIN_FLIPS  128
+
 void clrscr(void) {
     uint8_t y;
     for (y = 0; y < 17; y++) { gotoxy(0, y); printf("                    "); }
@@ -247,56 +322,119 @@ void wait_for(uint8_t mask) {
     waitpadup();
 }
 
-void title_screen(void) {
+/* Returns the chosen mode: J_A (button) or J_SELECT (coin). */
+uint8_t title_screen(void) {
+    uint8_t pad;
     clrscr();
     gotoxy(2, 1);  printf("GB COLD WALLET");
     gotoxy(3, 2);  printf("BIP39  EDITION");
-    gotoxy(0, 4);  printf("12-word seed");
-    gotoxy(0, 5);  printf("phrase generator");
-    gotoxy(0, 6);  printf("on a Game Boy.");
-    gotoxy(0, 8);  printf("128 bits entropy");
-    gotoxy(0, 9);  printf("+ SHA-256 csum,");
-    gotoxy(0, 10); printf("English wordlist");
-    gotoxy(0, 11); printf("burned into ROM.");
-    gotoxy(0, 17); printf(" PRESS A TO BEGIN");
-    wait_for(J_A);
+    gotoxy(0, 4);  printf("12-word seed,");
+    gotoxy(0, 5);  printf("HMAC-SHA256");
+    gotoxy(0, 6);  printf("whitened entropy.");
+    gotoxy(0, 8);  printf("A   = button");
+    gotoxy(0, 9);  printf("      timing");
+    gotoxy(0, 10); printf("      (100x)");
+    gotoxy(0, 12); printf("SEL = coin flip");
+    gotoxy(0, 13); printf("      Up=1 Dn=0");
+    gotoxy(0, 14); printf("      (128x)");
+    gotoxy(0, 17); printf(" CHOOSE A MODE");
+
+    waitpadup();
+    while (1) {
+        pad = joypad();
+        if (pad & J_A)      { waitpadup(); return J_A; }
+        if (pad & J_SELECT) { waitpadup(); return J_SELECT; }
+        wait_vbl_done();
+    }
 }
 
-void entropy_screen(void) {
-    uint8_t taps = 0;
-    uint8_t pad, prev = 0xFF;
-    uint8_t bar, i;
+/* Button-timing entropy: tight polling loop, samples DIV/TIMA/LY at the
+   exact moment of each press edge -- no vblank quantisation. */
+void entropy_button(void) {
+    uint16_t taps = 0;
+    uint8_t  pad, prev = 0xFF;
+    uint8_t  bar, i;
 
     pool_reset();
+    /* Boot-time noise (weak; HMAC will whiten regardless). */
     for (i = 0; i < 8; i++) {
         pool_byte(DIV_REG);
-        pool_byte((uint8_t)sys_time);
+        pool_byte(TIMA_REG);
     }
 
     clrscr();
     gotoxy(0, 0); printf(" GATHERING ENTROPY");
     gotoxy(0, 2); printf("Mash any button.");
-    gotoxy(0, 3); printf("64 presses needed.");
-    gotoxy(0, 5); printf("Each press samples");
-    gotoxy(0, 6); printf("the DIV timer for");
-    gotoxy(0, 7); printf("randomness.");
+    gotoxy(0, 3); printf("100 presses needed");
+    gotoxy(0, 5); printf("DIV+TIMA+LY are");
+    gotoxy(0, 6); printf("sampled at every");
+    gotoxy(0, 7); printf("press edge inside");
+    gotoxy(0, 8); printf("a tight poll loop.");
     gotoxy(0, 14); printf("[                  ]");
 
-    while (taps < 64) {
+    /* TIGHT LOOP -- no wait_vbl_done: every iteration touches DIV
+       so the sampled byte is unpredictable to ~16 CPU cycles. */
+    while (taps < BTN_PRESSES) {
         pad = joypad();
         if (pad && pad != prev) {
-            mix_tick(pad);
+            mix_press(pad);
             taps++;
-            bar = (uint8_t)((uint16_t)taps * 18 / 64);
+            bar = (uint8_t)((taps * 18) / BTN_PRESSES);
             gotoxy(1, 14);
             for (i = 0; i < 18; i++) printf("%c", i < bar ? '*' : ' ');
-            gotoxy(0, 16); printf("Presses: %u/64   ", taps);
+            gotoxy(0, 16); printf("Presses: %u/%u   ",
+                                  taps, (uint16_t)BTN_PRESSES);
+        }
+        prev = pad;
+        /* Spin-sample DIV: this is the entire point of the tight loop. */
+        pool_byte(DIV_REG);
+    }
+    gotoxy(0, 17); printf(" HASHING...        ");
+}
+
+/* Coin-flip entropy: D-pad Up=1, Down=0.  128 bits packed directly. */
+void entropy_coin(void) {
+    uint8_t  bits[COIN_FLIPS];
+    uint8_t  packed[16];
+    uint16_t got = 0;
+    uint8_t  pad, prev = 0xFF;
+    uint8_t  bar, i;
+
+    clrscr();
+    gotoxy(0, 0); printf("  COIN-FLIP MODE");
+    gotoxy(0, 2); printf("D-pad UP   = 1");
+    gotoxy(0, 3); printf("D-pad DOWN = 0");
+    gotoxy(0, 4); printf("B = undo last");
+    gotoxy(0, 6); printf("Use a real coin");
+    gotoxy(0, 7); printf("or dice for true");
+    gotoxy(0, 8); printf("128-bit entropy.");
+    gotoxy(0, 14); printf("[                  ]");
+
+    while (got < COIN_FLIPS) {
+        pad = joypad();
+        if (pad && pad != prev) {
+            if (pad & J_UP)                  { bits[got++] = 1; }
+            else if (pad & J_DOWN)           { bits[got++] = 0; }
+            else if ((pad & J_B) && got > 0) { got--; }
+
+            bar = (uint8_t)((got * 18) / COIN_FLIPS);
+            gotoxy(1, 14);
+            for (i = 0; i < 18; i++) printf("%c", i < bar ? '*' : ' ');
+            gotoxy(0, 16); printf("Flips: %u/%u    ",
+                                  got, (uint16_t)COIN_FLIPS);
+            gotoxy(0, 17); printf(" LAST: %c          ",
+                                  got ? (bits[got-1] ? '1' : '0') : ' ');
         }
         prev = pad;
         wait_vbl_done();
     }
+
+    /* Pack 128 bits into 16 bytes; load directly into the pool so the
+       HMAC step still runs and gives uniform domain-separated output. */
+    pack_bits(bits, COIN_FLIPS, packed);
+    pool_reset();
+    for (i = 0; i < 16; i++) pool_byte(packed[i]);
     gotoxy(0, 17); printf(" HASHING...        ");
-    for (i = 0; i < 16; i++) mix_tick(i ^ taps);
 }
 
 void show_seed(void) {
@@ -305,8 +443,6 @@ void show_seed(void) {
     clrscr();
     gotoxy(2, 0); printf("YOUR 12-WORD SEED");
 
-    /* Two columns of 6 words.  Use gotoxy per column; no width specifiers
-       (GBDK's minimal printf does not support %-Ns for strings). */
     for (i = 0; i < 6; i++) {
         gotoxy(0, 2 + i);
         printf("%u.%s", (uint16_t)(i + 1), word_at(mnemonic[i]));
@@ -331,15 +467,14 @@ void info_screen(void) {
     gotoxy(0, 3); printf("128b entropy + 4b");
     gotoxy(0, 4); printf("SHA-256 checksum");
     gotoxy(0, 5); printf("= 132b / 11 = 12");
-    gotoxy(0, 6); printf("words from the");
-    gotoxy(0, 7); printf("standard 2048-");
-    gotoxy(0, 8); printf("word English list.");
-    gotoxy(0, 10); printf("Import into any");
-    gotoxy(0, 11); printf("BIP39 wallet:");
-    gotoxy(0, 12); printf("Electrum, Trezor,");
-    gotoxy(0, 13); printf("Sparrow, etc.");
-    gotoxy(0, 15); printf("It will work, but");
-    gotoxy(0, 16); printf("entropy is weak.");
+    gotoxy(0, 6); printf("words from 2048-");
+    gotoxy(0, 7); printf("word English list.");
+    gotoxy(0, 9); printf("Pool whitened by");
+    gotoxy(0, 10); printf("HMAC-SHA256, key:");
+    gotoxy(0, 11); printf("GB-COLDWALLET-v2");
+    gotoxy(0, 13); printf("Compatible with:");
+    gotoxy(0, 14); printf("Electrum, Trezor,");
+    gotoxy(0, 15); printf("Sparrow, Ledger.");
     gotoxy(0, 17); printf(" PRESS B TO RETURN");
     wait_for(J_B);
 }
@@ -352,10 +487,16 @@ void main(void) {
     DISPLAY_ON;
     SHOW_BKG;
 
-    title_screen();
+    /* Enable TIMA hardware timer at 262144 Hz.
+       TAC bits: 0b101 = enable + clock-select 01 (262144 Hz on DMG). */
+    TMA_REG = 0;
+    TAC_REG = 0x05;
 
     while (1) {
-        entropy_screen();
+        uint8_t mode = title_screen();
+        if (mode == J_A) entropy_button();
+        else             entropy_coin();
+
         make_mnemonic();
         show_seed();
 

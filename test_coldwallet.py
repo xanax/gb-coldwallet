@@ -10,6 +10,7 @@ Run with:  python test_coldwallet.py
 """
 
 import hashlib
+import hmac
 import struct
 import sys
 import unittest
@@ -103,6 +104,43 @@ def extract11(src: bytes, off: int) -> int:
     v = (src[bo] << 16) | (src[bo+1] << 8) | src[bo+2]
     v >>= (24 - 11 - bi)
     return v & 0x7FF
+
+# ---------------------------------------------------------------------------
+# Faithful Python port of hmac_sha256 (from coldwallet.c)
+# Implemented in terms of sha256_port so we test BOTH the C SHA core AND
+# the C HMAC construction together.
+# ---------------------------------------------------------------------------
+
+def hmac_sha256_port(key: bytes, msg: bytes) -> bytes:
+    """RFC 2104 HMAC-SHA256 using the C-ported SHA-256."""
+    assert len(key) <= 64, "C version assumes klen < 64"
+    block_pad = key + b"\x00" * (64 - len(key))
+    ipad = bytes(b ^ 0x36 for b in block_pad)
+    opad = bytes(b ^ 0x5c for b in block_pad)
+    return sha256_port(opad + sha256_port(ipad + msg))
+
+# ---------------------------------------------------------------------------
+# Faithful Python port of pack_bits (from coldwallet.c)
+# ---------------------------------------------------------------------------
+
+def pack_bits(bits) -> bytes:
+    """Pack a sequence of 0/1 ints (MSB-first) into bytes."""
+    out = bytearray((len(bits) + 7) // 8)
+    for i, b in enumerate(bits):
+        if b & 1:
+            out[i >> 3] |= 1 << (7 - (i & 7))
+    return bytes(out)
+
+# ---------------------------------------------------------------------------
+# Domain-separator key (must match HMAC_KEY in coldwallet.c)
+# ---------------------------------------------------------------------------
+
+HMAC_KEY = b"GB-COLDWALLET-v2-BIP39-entropy"
+
+def derive_from_pool(pool: bytes) -> list:
+    """Mirror the C make_mnemonic(): HMAC-SHA256(pool) -> 16-byte entropy -> mnemonic."""
+    entropy = hmac_sha256_port(HMAC_KEY, pool)[:16]
+    return make_mnemonic(entropy)
 
 # ---------------------------------------------------------------------------
 # Faithful Python port of make_mnemonic (from coldwallet.c)
@@ -304,6 +342,121 @@ class TestChecksumValidation(unittest.TestCase):
         w_bad = make_mnemonic(bytes(ent_flipped))[-1]
         self.assertNotEqual(w_ok, w_bad,
             "A 1-bit entropy change should alter the mnemonic")
+
+
+class TestHMACSha256(unittest.TestCase):
+    """Verify our C-ported HMAC-SHA256 matches stdlib hmac for varied inputs."""
+
+    def _check(self, key: bytes, msg: bytes):
+        expected = hmac.new(key, msg, hashlib.sha256).digest()
+        got      = hmac_sha256_port(key, msg)
+        self.assertEqual(got, expected,
+            f"HMAC mismatch\n key={key!r}\n msg={msg!r}")
+
+    def test_rfc4231_case1(self):
+        # RFC 4231 test case 1
+        self._check(b"\x0b" * 20, b"Hi There")
+
+    def test_rfc4231_case2(self):
+        self._check(b"Jefe", b"what do ya want for nothing?")
+
+    def test_empty_msg(self):
+        self._check(b"key", b"")
+
+    def test_empty_key(self):
+        self._check(b"", b"data")
+
+    def test_long_msg(self):
+        self._check(b"some-key", b"A" * 200)
+
+    def test_domain_separator(self):
+        # The exact key used in production
+        self._check(HMAC_KEY, b"the entropy pool")
+
+    def test_block_size_msg(self):
+        # Msg length forces multi-block compression in inner & outer hashes
+        self._check(b"k", b"x" * 64)
+
+
+class TestPackBits(unittest.TestCase):
+    """Verify the bit-packing port matches the C implementation byte-for-byte."""
+
+    def test_empty(self):
+        self.assertEqual(pack_bits([]), b"")
+
+    def test_one_bit_set(self):
+        # Bit 0 is the MSB of the first output byte
+        self.assertEqual(pack_bits([1]), b"\x80")
+        self.assertEqual(pack_bits([0]), b"\x00")
+
+    def test_eight_bits_high(self):
+        self.assertEqual(pack_bits([1] * 8), b"\xff")
+
+    def test_alternating(self):
+        self.assertEqual(pack_bits([1, 0] * 8), b"\xaa\xaa")
+
+    def test_partial_trailing_byte(self):
+        # 11 bits: 11111111 111_____  ->  0xFF, 0xE0
+        self.assertEqual(pack_bits([1] * 11), b"\xff\xe0")
+
+    def test_128_bits(self):
+        # 128 alternating bits -> 16 bytes of 0xAA
+        self.assertEqual(pack_bits([1, 0] * 64), b"\xaa" * 16)
+
+    def test_only_low_bit_used(self):
+        # The C version masks input with `& 1`:
+        # 0xFF&1=1, 0x02&1=0, 0x01&1=1, 0x00&1=0  ->  bits 1010 1010 1010 1010
+        self.assertEqual(pack_bits([0xFF, 0x02, 0x01, 0x00] * 2), b"\xaa")
+
+
+class TestPoolDerivation(unittest.TestCase):
+    """
+    Verify the pool->mnemonic pipeline (HMAC-SHA256 whitening + BIP39).
+    These are the exact bytes the on-cart C code will produce for a given pool.
+    """
+
+    def test_empty_pool_known_mnemonic(self):
+        # Computed with hmac.new(HMAC_KEY, b"", sha256).digest()[:16]
+        # Then BIP39-encoded.  This pins the exact derivation behaviour.
+        expected_entropy = hmac.new(HMAC_KEY, b"", hashlib.sha256).digest()[:16]
+        expected_mnemonic = make_mnemonic(expected_entropy)
+        self.assertEqual(derive_from_pool(b""), expected_mnemonic)
+
+    def test_one_byte_pool(self):
+        for b in (0x00, 0x55, 0xAA, 0xFF):
+            with self.subTest(byte=b):
+                expected_entropy = hmac.new(HMAC_KEY, bytes([b]),
+                                            hashlib.sha256).digest()[:16]
+                self.assertEqual(
+                    derive_from_pool(bytes([b])),
+                    make_mnemonic(expected_entropy),
+                )
+
+    def test_coin_flip_pool(self):
+        # Simulate 128 coin flips of all 1s -> 16 bytes of 0xFF
+        flips = [1] * 128
+        packed = pack_bits(flips)
+        self.assertEqual(packed, b"\xff" * 16)
+        mn = derive_from_pool(packed)
+        self.assertEqual(len(mn), 12)
+        for w in mn:
+            self.assertIn(w, set(WORDS))
+
+    def test_pool_change_avalanches(self):
+        a = derive_from_pool(b"\x00" * 16)
+        b = derive_from_pool(b"\x00" * 15 + b"\x01")
+        # Single-bit pool change must change every word
+        diffs = sum(1 for x, y in zip(a, b) if x != y)
+        self.assertGreaterEqual(diffs, 11,
+            f"HMAC avalanche too weak: only {diffs}/12 words changed")
+
+    def test_hmac_not_bare_sha(self):
+        # Whitening must NOT equal a bare sha256(pool) prefix --
+        # otherwise the domain separator key isn't actually being used.
+        pool = b"my pool data"
+        whitened     = hmac_sha256_port(HMAC_KEY, pool)[:16]
+        bare_sha     = sha256_port(pool)[:16]
+        self.assertNotEqual(whitened, bare_sha)
 
 
 class TestMnemonicProperties(unittest.TestCase):
