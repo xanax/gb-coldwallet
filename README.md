@@ -4,6 +4,8 @@
 > No network. No storage. No radio. No batteries (well, four AAs).
 > The world's most air-gapped Bitcoin seed generator.
 
+![GB Cold Wallet running on hardware](GB%20Cold%20Wallet%20%28BTC%29-260427-132629.png)
+
 ![ROM size](https://img.shields.io/badge/ROM-32%20KB-informational)
 ![Tests](https://img.shields.io/badge/tests-50%20passing-brightgreen)
 ![BIP39](https://img.shields.io/badge/BIP39-RFC%204231%20HMAC--SHA256-blue)
@@ -36,14 +38,14 @@ have a fundable Bitcoin address.
      handhelds, ...), or
    - Flash it to a real cartridge (e.g. EverDrive GB).
 3. On the title screen, choose your entropy source:
-   - **A** — 100 button-press timing samples, or
+   - **A** — shuffle a real deck of cards and enter 22 of them, or
    - **SELECT** — 128 D-pad coin flips (`Up` = 1, `Down` = 0, `B` = undo).
 4. Read the 12 words. Write them on paper. Power off.
 
 ## How it works
 
 ```
-entropy pool  (DIV + TIMA + LY + pad samples,  OR  128 packed coin flips)
+entropy pool  (22 shuffled-card bytes  OR  128 packed coin flips)
    |
    |  HMAC-SHA256(key = "GB-COLDWALLET-BIP39-entropy", msg = pool)
    v
@@ -54,17 +56,17 @@ first 16 bytes  =  128-bit BIP39 entropy
 4-bit BIP39 checksum  ->  132 bits  ->  12 x 11-bit indices  ->  12 BIP39 words
 ```
 
-Two completely independent entropy modes:
+Two completely independent entropy modes — both physically observable, both free of any hardware-RNG or timing assumption:
 
 | Mode | Source | Bits | Notes |
 |---|---|---|---|
-| **Button** | DIV_REG, TIMA_REG, LY_REG and pad bitmask sampled at every press edge in a tight polling loop | 100 presses x 4 byte samples | Press timing resolved to ~16 CPU cycles (~1 us), not the 17 ms vblank quantum. Three orthogonal hardware counters per press. |
-| **Coin flip** | User D-pad input, 1 bit per press | 128 directly observable bits | No timing assumptions at all. Use a real coin or dice for a paper-wallet-grade workflow. |
+| **Cards** | Shuffle a real 52-card deck. Enter the top 22 cards (value + suit) on the D-pad. | log2(52^22) ≈ 125 raw, HMAC-whitened to 128 | Up/Down picks value (A,2..9,T,J,Q,K). Left/Right picks suit (S H D C). A commits, B undoes. The randomness lives in your hands, not in the chip. |
+| **Coin flip** | User D-pad input, 1 bit per press | 128 directly observable bits | Use a real coin or dice for paper-wallet-grade entropy. Up = 1, Down = 0, B = undo. |
 
 The pool is whitened through **HMAC-SHA256** (RFC 2104) with a fixed
 domain-separator key. HMAC — not bare SHA-256 — protects against
-length-extension and ensures the output is uniform even when the raw pool
-has biases.
+length-extension and ensures the output is uniform even when the raw
+pool is short or biased.
 
 The SHA-256 implementation is written from the FIPS 180-4 specification.
 There is no third-party crypto code in the ROM.
@@ -73,17 +75,13 @@ There is no third-party crypto code in the ROM.
 
 - **No networking, no storage, no radio.** Entropy never leaves the chip.
 - **No firmware update channel.** What you flash is what you get.
-- **Tight-loop sampling** of `DIV_REG` resolves press timing to ~16 CPU
-  cycles, gaining ~8 extra bits of timing entropy per press over a naive
-  vblank-quantised sampler.
-- **TIMA_REG** is enabled at 262 144 Hz at boot and sampled at every press
-  edge as an independent timing source.
-- **`LY_REG`** (current scanline, ~9.2 kHz) is mixed in as a third
-  orthogonal hardware counter per press.
+- **Card-shuffle mode** moves the entire RNG outside of the device:
+  the randomness comes from your hands shuffling a physical deck,
+  not from any oscillator, jitter source, or hardware register.
+- **Coin-flip mode** is the same idea with one bit per press:
+  128 user-chosen bits go straight into the pool.
 - **HMAC-SHA256 whitening** with a domain-separator key prevents
-  length-extension and ensures uniform output even from a biased pool.
-- **Coin-flip mode** removes all timing assumptions: 128 user-chosen bits
-  go straight into the pool.
+  length-extension and ensures uniform output even from a short pool.
 - **2048-word BIP39 English wordlist** is embedded read-only in ROM.
 
 > The Game Boy has no side-channel countermeasures. This is a fun,
@@ -95,8 +93,16 @@ There is no third-party crypto code in the ROM.
 ### Title screen
 | Button | Action |
 |---|---|
-| **A** | Button-timing entropy mode (100 presses) |
+| **A** | Card-shuffle entropy mode (22 cards) |
 | **SELECT** | Coin-flip entropy mode (128 D-pad flips) |
+
+### Card-shuffle mode
+| Button | Action |
+|---|---|
+| **Up / Down** | Change value (A, 2-9, T, J, Q, K) |
+| **Left / Right** | Change suit (S=spades, H=hearts, D=diamonds, C=clubs) |
+| **A** | Commit current card, advance to next |
+| **B** | Undo last committed card |
 
 ### Coin-flip mode
 | Button | Action |

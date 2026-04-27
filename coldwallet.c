@@ -10,15 +10,11 @@
  *   ---------------
  *   Two independent collection modes are offered:
  *
- *     BUTTON MODE (A on title)
- *       100 button presses.  At every press edge -- detected in a tight
- *       polling loop, NOT a vblank wait -- we sample:
- *           DIV_REG   (8-bit, increments at 16384 Hz)
- *           TIMA_REG  (8-bit, configured at 262144 Hz)
- *           LY_REG    (8-bit scanline counter, ~9.2 kHz)
- *           the pad bitmask
- *       Press timing is therefore resolved to ~16 CPU cycles, not the
- *       17 ms vblank quantum.
+ *     CARD-SHUFFLE MODE (A on title)
+ *       Shuffle a real deck of 52 playing cards by hand, then enter
+ *       the top 22 cards (value + suit) on the D-pad.  log2(52^22)
+ *       ~= 125 bits of physically-shuffled entropy, packed as 22 bytes
+ *       and fed straight into the HMAC.  No timing assumptions at all.
  *
  *     COIN MODE (SELECT on title)
  *       128 D-pad flips (Up = 1, Down = 0).  Provides 128 directly
@@ -306,8 +302,8 @@ const char *word_at(uint16_t idx) {
  *  UI
  * ==================================================================== */
 
-#define BTN_PRESSES 100
 #define COIN_FLIPS  128
+#define CARD_COUNT  22       /* 22 cards x 6 bits = 132 bits raw */
 
 void clrscr(void) {
     uint8_t y;
@@ -322,7 +318,7 @@ void wait_for(uint8_t mask) {
     waitpadup();
 }
 
-/* Returns the chosen mode: J_A (button) or J_SELECT (coin). */
+/* Returns the chosen mode: J_A (cards) or J_SELECT (coin). */
 uint8_t title_screen(void) {
     uint8_t pad;
     clrscr();
@@ -331,9 +327,9 @@ uint8_t title_screen(void) {
     gotoxy(0, 4);  printf("12-word seed,");
     gotoxy(0, 5);  printf("HMAC-SHA256");
     gotoxy(0, 6);  printf("whitened entropy.");
-    gotoxy(0, 8);  printf("A   = button");
-    gotoxy(0, 9);  printf("      timing");
-    gotoxy(0, 10); printf("      (100x)");
+    gotoxy(0, 8);  printf("A   = shuffled");
+    gotoxy(0, 9);  printf("      deck of");
+    gotoxy(0, 10); printf("      cards (22)");
     gotoxy(0, 12); printf("SEL = coin flip");
     gotoxy(0, 13); printf("      Up=1 Dn=0");
     gotoxy(0, 14); printf("      (128x)");
@@ -348,47 +344,63 @@ uint8_t title_screen(void) {
     }
 }
 
-/* Button-timing entropy: tight polling loop, samples DIV/TIMA/LY at the
-   exact moment of each press edge -- no vblank quantisation. */
-void entropy_button(void) {
-    uint16_t taps = 0;
+/* Card-shuffle entropy.  Shuffle a real deck, then enter what you see:
+   value via UP/DOWN (A,2..9,T,J,Q,K), suit via LEFT/RIGHT (S H D C),
+   A to commit, B to undo. 22 cards x log2(13*4) bits = 125.7 bits raw,
+   stored as 22 bytes (high nibble = value 0..12, low 2 bits = suit 0..3)
+   then HMAC-SHA256 whitened to a uniform 128-bit BIP39 entropy. */
+static const char VALUE_CHARS[13] = {
+    'A','2','3','4','5','6','7','8','9','T','J','Q','K'
+};
+static const char SUIT_CHARS[4]  = { 'S','H','D','C' };
+
+void entropy_cards(void) {
+    uint8_t  cards[CARD_COUNT];   /* (value<<2)|suit, value in 0..12 */
+    uint16_t got = 0;
     uint8_t  pad, prev = 0xFF;
     uint8_t  bar, i;
-
-    pool_reset();
-    /* Boot-time noise (weak; HMAC will whiten regardless). */
-    for (i = 0; i < 8; i++) {
-        pool_byte(DIV_REG);
-        pool_byte(TIMA_REG);
-    }
+    uint8_t  cur_v = 0, cur_s = 0;
 
     clrscr();
-    gotoxy(0, 0); printf(" GATHERING ENTROPY");
-    gotoxy(0, 2); printf("Mash any button.");
-    gotoxy(0, 3); printf("100 presses needed");
-    gotoxy(0, 5); printf("DIV+TIMA+LY are");
-    gotoxy(0, 6); printf("sampled at every");
-    gotoxy(0, 7); printf("press edge inside");
-    gotoxy(0, 8); printf("a tight poll loop.");
+    gotoxy(0, 0); printf("  CARD-SHUFFLE");
+    gotoxy(0, 2); printf("Shuffle a real");
+    gotoxy(0, 3); printf("deck. Enter the");
+    gotoxy(0, 4); printf("top 22 cards.");
+    gotoxy(0, 6); printf("Up/Dn = value");
+    gotoxy(0, 7); printf("L/R   = suit");
+    gotoxy(0, 8); printf("A     = next");
+    gotoxy(0, 9); printf("B     = undo");
+    gotoxy(0, 11); printf("Suits: S H D C");
     gotoxy(0, 14); printf("[                  ]");
 
-    /* TIGHT LOOP -- no wait_vbl_done: every iteration touches DIV
-       so the sampled byte is unpredictable to ~16 CPU cycles. */
-    while (taps < BTN_PRESSES) {
+    while (got < CARD_COUNT) {
         pad = joypad();
         if (pad && pad != prev) {
-            mix_press(pad);
-            taps++;
-            bar = (uint8_t)((taps * 18) / BTN_PRESSES);
+            if      (pad & J_UP)    { cur_v = (cur_v == 0) ? 12 : cur_v - 1; }
+            else if (pad & J_DOWN)  { cur_v = (cur_v == 12) ? 0 : cur_v + 1; }
+            else if (pad & J_LEFT)  { cur_s = (cur_s == 0) ? 3  : cur_s - 1; }
+            else if (pad & J_RIGHT) { cur_s = (cur_s == 3) ? 0  : cur_s + 1; }
+            else if (pad & J_A)     { cards[got++] = (uint8_t)((cur_v << 2) | cur_s); }
+            else if ((pad & J_B) && got > 0) { got--; }
+
+            bar = (uint8_t)((got * 18) / CARD_COUNT);
             gotoxy(1, 14);
             for (i = 0; i < 18; i++) printf("%c", i < bar ? '*' : ' ');
-            gotoxy(0, 16); printf("Presses: %u/%u   ",
-                                  taps, (uint16_t)BTN_PRESSES);
+            gotoxy(0, 16); printf("Cards: %u/%u    ",
+                                  got, (uint16_t)CARD_COUNT);
+            /* Current selection on row 17, last accepted card to its right. */
+            gotoxy(0, 17); printf(" PICK %c%c  LAST %c%c ",
+                                  VALUE_CHARS[cur_v], SUIT_CHARS[cur_s],
+                                  got ? VALUE_CHARS[cards[got-1] >> 2] : ' ',
+                                  got ? SUIT_CHARS[cards[got-1] & 3]  : ' ');
         }
         prev = pad;
-        /* Spin-sample DIV: this is the entire point of the tight loop. */
-        pool_byte(DIV_REG);
+        wait_vbl_done();
     }
+
+    /* Load the 22 raw bytes straight into the pool; HMAC whitens. */
+    pool_reset();
+    for (i = 0; i < CARD_COUNT; i++) pool_byte(cards[i]);
     gotoxy(0, 17); printf(" HASHING...        ");
 }
 
@@ -494,7 +506,7 @@ void main(void) {
 
     while (1) {
         uint8_t mode = title_screen();
-        if (mode == J_A) entropy_button();
+        if (mode == J_A) entropy_cards();
         else             entropy_coin();
 
         make_mnemonic();
