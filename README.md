@@ -1,4 +1,4 @@
-# GB Cold Wallet
+# Game Boy Cold Wallet
 
 > **Generate a real Bitcoin BIP39 seed phrase on a 1989 Game Boy.**
 > No network. No storage. No radio. No batteries (well, four AAs).
